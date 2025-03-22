@@ -3,10 +3,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from collections import Counter
+import io
 
 # Set page config
 st.set_page_config(
-    page_title="TCGA BRCA Mutation Analysis",
+    page_title="TCGA Mutation Analysis",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -35,37 +36,91 @@ plot_layout = dict(
     font=dict(size=12)
 )
 
+# Required columns for the mutation data
+REQUIRED_COLUMNS = [
+    'hugoGeneSymbol',
+    'patientId',
+    'mutationType',
+    'proteinChange',
+    'proteinPosStart'
+]
+
 # Load mutation data
 @st.cache_data
-def load_data():
+def load_data(file_path=None, uploaded_file=None):
     try:
-        df = pd.read_csv('data/brca_tcga_pub2015_mutations.csv')
+        if uploaded_file is not None:
+            # Read the uploaded file
+            df = pd.read_csv(uploaded_file)
+        elif file_path is not None:
+            # Read from local file path
+            df = pd.read_csv(file_path)
+        else:
+            return None
+        
+        # Validate required columns
+        missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+        if missing_cols:
+            st.error(f"Missing required columns: {', '.join(missing_cols)}")
+            return None
+            
         return df
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
         return None
 
-# Load the data
-mutations_df = load_data()
+# File upload section in sidebar
+st.sidebar.header('Data Input')
+uploaded_file = st.sidebar.file_uploader(
+    "Upload mutation data file (CSV)",
+    type=['csv'],
+    help="Upload a CSV file containing mutation data. Required columns: " + ", ".join(REQUIRED_COLUMNS)
+)
+
+# Load either uploaded file or default file
+if uploaded_file is not None:
+    mutations_df = load_data(uploaded_file=uploaded_file)
+else:
+    st.sidebar.write("No file uploaded. Using default TCGA BRCA mutation data.")
+    mutations_df = load_data(file_path='data/brca_tcga_pub2015_mutations.csv')
 
 if mutations_df is None:
     st.error("Failed to load mutation data. Please check the data file and try again.")
     st.stop()
 
+# Display data summary
+st.sidebar.write("Data Summary:")
+st.sidebar.write(f"Total mutations: {len(mutations_df)}")
+st.sidebar.write(f"Total genes: {mutations_df['hugoGeneSymbol'].nunique()}")
+st.sidebar.write(f"Total patients: {mutations_df['patientId'].nunique()}")
+
 # Get unique genes for selection
 unique_genes = sorted(mutations_df['hugoGeneSymbol'].unique())
 
 # Main dashboard
-st.title('TCGA BRCA Mutation Analysis Dashboard')
+st.title('Mutation Analysis Dashboard')
 
 # Sidebar for gene selection
 st.sidebar.header('Gene Selection')
 
+# Search box for genes
+gene_search = st.sidebar.text_input(
+    "Search genes",
+    "",
+    help="Type to search for specific genes"
+)
+
+# Filter genes based on search
+if gene_search:
+    filtered_genes = [gene for gene in unique_genes if gene_search.upper() in gene.upper()]
+else:
+    filtered_genes = unique_genes
+
 # Multi-select for genes
 selected_genes = st.sidebar.multiselect(
     'Select genes to analyze',
-    options=unique_genes,
-    default=unique_genes[:5] if len(unique_genes) > 5 else unique_genes
+    options=filtered_genes,
+    default=filtered_genes[:5] if len(filtered_genes) > 5 else filtered_genes
 )
 
 if not selected_genes:
@@ -116,7 +171,16 @@ with col2:
         names=mutation_type_counts.index,
         title="Distribution of Mutation Types"
     )
-    fig_mutation_types.update_layout(**plot_layout)
+    fig_mutation_types.update_layout(
+        **plot_layout,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
     st.plotly_chart(fig_mutation_types, use_container_width=True)
 
 # Second row - Top protein changes by gene
@@ -146,7 +210,7 @@ for gene in selected_genes:
             st.plotly_chart(fig_protein, use_container_width=True)
         
         with col2:
-            # Mutation types for this gene (changed from variant types)
+            # Mutation types for this gene
             mutation_types = gene_data['mutationType'].value_counts()
             fig_variants = px.pie(
                 values=mutation_types.values,
@@ -175,18 +239,52 @@ for gene in selected_genes:
         # Convert position to numeric, handling any errors
         gene_data['proteinPosStart'] = pd.to_numeric(gene_data['proteinPosStart'], errors='coerce')
         
-        fig_position = px.histogram(
-            gene_data,
-            x='proteinPosStart',
+        # Create a count of mutations at each position
+        position_counts = gene_data['proteinPosStart'].value_counts().reset_index()
+        position_counts.columns = ['Position', 'Count']
+        
+        fig_position = px.scatter(
+            position_counts,
+            x='Position',
+            y='Count',
             title=f"Mutation Position Distribution in {gene}",
-            nbins=50
+            labels={'Position': 'Protein Position', 'Count': 'Number of Mutations'},
+            size='Count',  # Size of points based on mutation count
+            hover_data={'Position': True, 'Count': True}
         )
+        
         fig_position.update_layout(
             **plot_layout,
             xaxis_title="Protein Position",
-            yaxis_title="Number of Mutations"
+            yaxis_title="Number of Mutations",
+            showlegend=False,
+            hovermode='closest'
         )
+        
+        # Update marker properties
+        fig_position.update_traces(
+            marker=dict(
+                sizeref=2.*max(position_counts['Count'])/(40.**2),  # Adjust point size scaling
+                sizemin=4,  # Minimum point size
+                opacity=0.7
+            )
+        )
+        
         st.plotly_chart(fig_position, use_container_width=True)
+        
+        # Add a data table with hotspot positions (positions with multiple mutations)
+        hotspots = position_counts[position_counts['Count'] > 1].sort_values('Count', ascending=False).head(10)
+        if not hotspots.empty:
+            st.write(f"### Top Mutation Hotspots in {gene}")
+            st.write("Positions with multiple mutations:")
+            st.dataframe(
+                hotspots,
+                column_config={
+                    "Position": st.column_config.NumberColumn("Position", help="Protein position"),
+                    "Count": st.column_config.NumberColumn("Mutations", help="Number of mutations at this position")
+                },
+                hide_index=True
+            )
 
 # Download section
 st.sidebar.header("Download Data")
